@@ -1,0 +1,13 @@
+train: ../train/images_o
+val: ../valid/images_o
+test: ../test/images_o
+
+nc: 12
+names: ['Carpetweed', 'CutleafGroundcherry', 'Eclipta', 'Goosegrass', 'MorningGlory', 'PalmerAmaranth', 'PricklySida', 'Purslane', 'Ragweed', 'Sicklepod', 'SpottedSpurge', 'Waterhemp']
+
+roboflow:
+  workspace: aerial-solar-panels
+  project: weed-zo3ve-2dfpq
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/aerial-solar-panels/weed-zo3ve-2dfpq/dataset/1
