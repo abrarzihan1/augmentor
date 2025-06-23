@@ -1,6 +1,6 @@
-train: ../train/images_o
-val: ../valid/images_o
-test: ../test/images_o
+train: ../train/images
+val: ../valid/images
+test: ../test/images
 
 nc: 12
 names: ['Carpetweed', 'CutleafGroundcherry', 'Eclipta', 'Goosegrass', 'MorningGlory', 'PalmerAmaranth', 'PricklySida', 'Purslane', 'Ragweed', 'Sicklepod', 'SpottedSpurge', 'Waterhemp']
