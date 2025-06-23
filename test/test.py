@@ -2,11 +2,11 @@ import os
 from augmentor import augment, utils
 import cv2
 
-image_dir = '../datasets/tomato/train/images/'
-annotation_dir = '../datasets/tomato/train/labels/'
+image_dir = '../datasets/capsicum/train/images/'
+annotation_dir = '../datasets/capsicum/train/labels/'
 
-output_img_dir = './output/images_2/'
-output_annotation_dir = './output/labels_2/'
+output_img_dir = './output/images/'
+output_annotation_dir = './output/labels/'
 
 os.makedirs(output_img_dir, exist_ok=True)
 os.makedirs(output_annotation_dir, exist_ok=True)
