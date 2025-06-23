@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 5
+names: ['BrownishRed--Can-be-Harvested', 'Green--Not-ready-to-harvest', 'GreenishYellow--Can-be-Harvested', 'Red-Ready-to-Harvest', 'Yellow-Ready-to-Harvest']
+
+roboflow:
+  workspace: aerial-solar-panels
+  project: matured-capsicum-detection-iigdh
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/aerial-solar-panels/matured-capsicum-detection-iigdh/dataset/1
