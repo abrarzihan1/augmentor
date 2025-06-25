@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import os
+import shutil
 
 # Helper function to load YOLO annotations (text format)
 def load_yolo_annotation(annotation_path):
@@ -115,3 +116,28 @@ def draw_image(image, bboxes, class_names=None, color=(0, 255, 0), thickness=2):
             cv2.putText(img_out, label, (x1, y1 - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
     return img_out
+
+
+def copy_folder_contents(source_folder, destination_folder):
+    # Check if the source folder exists
+    if not os.path.exists(source_folder):
+        print(f"Source folder {source_folder} does not exist.")
+        return
+
+    # Create the destination folder if it doesn't exist
+    if not os.path.exists(destination_folder):
+        os.makedirs(destination_folder)
+
+    # Iterate through the files and subdirectories in the source folder
+    for item in os.listdir(source_folder):
+        source_item = os.path.join(source_folder, item)
+        destination_item = os.path.join(destination_folder, item)
+
+        if os.path.isdir(source_item):
+            # If it's a directory, copy the entire directory and its contents
+            shutil.copytree(source_item, destination_item)
+        else:
+            # If it's a file, copy the file
+            shutil.copy2(source_item, destination_item)
+
+    print(f"All contents from {source_folder} have been copied to {destination_folder}.")
