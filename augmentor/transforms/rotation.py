@@ -22,6 +22,9 @@ def apply(image, annotations=None, **kwargs):
     aug = get_transform()
     transformed = aug(image=image, bboxes=bboxes, class_labels=labels)
 
+    # Clip bboxes to [0.0, 1.0]
+    transformed_bboxes = np.clip(transformed['bboxes'], 0.0, 1.0)
+
     # Combine class labels_o and bboxes
     if len(transformed['bboxes']) > 0:
         combined = np.array([
