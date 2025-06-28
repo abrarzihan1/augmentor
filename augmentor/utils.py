@@ -145,7 +145,7 @@ def copy_folder_contents(source_folder, destination_folder):
     print(f"All contents from {source_folder} have been copied to {destination_folder}.")
 
 
-def augment_image(method, image_dir, annotation_dir, output_img_dir, output_annotation_dir, seed):
+def augment_image(method, image_dir, annotation_dir, output_img_dir, output_annotation_dir):
     os.makedirs(output_img_dir, exist_ok=True)
     os.makedirs(output_annotation_dir, exist_ok=True)
 
