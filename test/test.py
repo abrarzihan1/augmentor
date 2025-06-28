@@ -25,7 +25,7 @@ for image_file in image_files:
     annotation_file = os.path.join(annotation_dir, annotation_file)
     annotation = utils.load_yolo_annotation(annotation_file)
 
-    aug_img, aug_labels = augment.translation(image, annotation)
+    aug_img, aug_labels = augment.cutout(image, annotation)
 
     cv2.imwrite(f'{output_img_dir}/aug_{image_file}', aug_img)
     utils.save_yolo_annotation(f"{output_annotation_dir}/aug_{image_file.replace('.jpg', '.txt')}", aug_labels)

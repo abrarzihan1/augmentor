@@ -1,8 +1,8 @@
 from augmentor import utils, augment
 import cv2
 
-img = cv2.imread("output/images/aug_IMG_1041.jpg")
-lbl = utils.load_yolo_annotation("output/labels/aug_IMG_1041.txt")
+img = cv2.imread("output_1/images/aug_29.jpg")
+lbl = utils.load_yolo_annotation("output_1/labels/aug_29.txt")
 
 aug_img, aug_lbl = img, lbl
 

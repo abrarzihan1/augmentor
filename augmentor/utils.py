@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 import os
 import shutil
+import random
+from . import augment
 
 # Helper function to load YOLO annotations (text format)
 def load_yolo_annotation(annotation_path):
@@ -141,3 +143,34 @@ def copy_folder_contents(source_folder, destination_folder):
             shutil.copy2(source_item, destination_item)
 
     print(f"All contents from {source_folder} have been copied to {destination_folder}.")
+
+
+def augment_image(method, image_dir, annotation_dir, output_img_dir, output_annotation_dir, seed):
+    os.makedirs(output_img_dir, exist_ok=True)
+    os.makedirs(output_annotation_dir, exist_ok=True)
+
+    image_files = [f for f in os.listdir(image_dir) if f.endswith('.jpg')]
+
+    if method == "mixup":
+        k = 2
+    else:
+        k = 4
+
+    for i in range(len(image_files)):
+        selected_files = random.sample(image_files, k)
+        images = [cv2.imread(os.path.join(image_dir, f)) for f in selected_files]
+        annotations = [load_yolo_annotation(os.path.join(annotation_dir, f.replace('.jpg', '.txt'))) for f in
+                       selected_files]
+
+        aug_image, aug_annotations = augment.apply_transform(method, images, annotations)
+
+        augmented_image_filename = f"aug_{i + 1}.jpg"
+        augmented_image_path = os.path.join(output_img_dir, augmented_image_filename)
+        cv2.imwrite(augmented_image_path, aug_image)
+
+        augmented_annotation_filename = f"aug_{i + 1}.txt"
+        augmented_annotation_path = os.path.join(output_annotation_dir, augmented_annotation_filename)
+        save_yolo_annotation(augmented_annotation_path, aug_annotations)
+
+    copy_folder_contents(image_dir, output_img_dir)
+    copy_folder_contents(annotation_dir, output_annotation_dir)
