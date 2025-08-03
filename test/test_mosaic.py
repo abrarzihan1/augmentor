@@ -4,14 +4,14 @@ import os
 import numpy as np
 from augmentor import augment, utils
 
-random.seed(1)
-np.random.seed(1)
+random.seed(99)
+np.random.seed(99)
 
 image_dir = '../datasets/tomato/train/images/'
 annotation_dir = '../datasets/tomato/train/labels/'
 
-output_img_dir = './output_1/images/'
-output_annotation_dir = './output_1/labels/'
+output_img_dir = './aug_3/images/'
+output_annotation_dir = './aug_3/labels/'
 
 os.makedirs(output_img_dir, exist_ok=True)
 os.makedirs(output_annotation_dir, exist_ok=True)
@@ -20,10 +20,28 @@ image_files = [f for f in os.listdir(image_dir) if f.endswith('.jpg')]
 
 for i in range(len(image_files)):
     selected_files = random.sample(image_files, 4)
-    images = [cv2.imread(os.path.join(image_dir, f)) for f in selected_files]
-    annotations = [utils.load_yolo_annotation(os.path.join(annotation_dir, f.replace('.jpg', '.txt'))) for f in selected_files]
 
-    aug_image, aug_annotations = augment.modified_mosaic(images, annotations)
+    images = []
+    annotations = []
+
+    for f in selected_files:
+        img_path = os.path.join(image_dir, f)
+        img = cv2.imread(img_path)
+
+        if img is None:
+            raise ValueError(f"Failed to load image: {img_path}")
+
+        ann_path = os.path.join(annotation_dir, f.replace('.jpg', '.txt'))
+        ann = utils.load_yolo_annotation(ann_path)
+
+        images.append(img)
+        annotations.append(ann)
+
+    # images = [cv2.imread(os.path.join(image_dir, f)) for f in selected_files]
+    # annotations = [utils.load_yolo_annotation(os.path.join(annotation_dir, f.replace('.jpg', '.txt'))) for f in selected_files]
+
+    aug_image, aug_annotations = augment.modified_mosaic_cutout(images, annotations)
+    # aug_image, aug_annotations = augment.apply_transform('modified_mosaic_cutout', images, annotations)
 
     augmented_image_filename = f"aug_{i + 1}.jpg"
     augmented_image_path = os.path.join(output_img_dir, augmented_image_filename)

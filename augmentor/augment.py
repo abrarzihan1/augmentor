@@ -7,7 +7,8 @@ from .transforms import (
     brightness_contrast,
     modified_mosaic,
     mixup,
-    cutout
+    cutout,
+    modified_mosaic_cutout
 )
 
 import numpy as np
@@ -23,9 +24,10 @@ TRANSFORMS = {
     'modified_mosaic': modified_mosaic.mosaic,
     'mixup': mixup.apply,
     'cutout': cutout.apply,
+    'modified_mosaic_cutout': modified_mosaic_cutout.apply,
 }
 
-multi_image_methods = ['mosaic', 'modified_mosaic', 'mixup']
+multi_image_methods = ['mosaic', 'modified_mosaic', 'mixup', 'modified_mosaic_cutout']
 
 def apply_transform(method, images, annotations=None, **kwargs):
     if method not in TRANSFORMS:
@@ -51,3 +53,4 @@ mosaic = mosaic.mosaic
 modified_mosaic = modified_mosaic.mosaic
 mixup = mixup.apply
 cutout = cutout.apply
+modified_mosaic_cutout = modified_mosaic_cutout.apply
