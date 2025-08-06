@@ -1,13 +1,15 @@
 import cv2
 import numpy as np
 import random
+from . import brightness_contrast
 
 def mosaic_cutmix(
     get_item_fn,
     dataset_size,
     output_size=(640, 640),
-    crop_offset=0.3,
-    cutmix_prob=0.5,
+    crop_offset=0.15,
+    cutmix_prob=0.1,
+    brightness_contrast_prob=0.1,
     min_box_size=0.01,  # Normalized threshold (e.g., 0.01 = 6.4 pixels on 640)
 ):
     w, h = output_size
@@ -134,6 +136,8 @@ def mosaic_cutmix(
         img, anns = _build_mosaic(idx)
         if random.random() < cutmix_prob:
             img, anns = _apply_cutmix(img, anns)
+        if random.random() < brightness_contrast_prob:
+            img, anns = brightness_contrast.apply(img, anns)
         return img, anns
 
     return _transform
