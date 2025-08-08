@@ -58,13 +58,13 @@ def enhanced_mosaic(
 
         p = mild if count >= 3 else strong
 
-        alpha = 1 + random.uniform(-p['brightness'], p['brightness'])
-        beta = random.uniform(-p['brightness']*50, p['brightness']*50)
-        img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
-
-        if random.random() < p['noise_p']:
-            noise = np.random.randn(h, w, 3) * 25
-            img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        # alpha = 1 + random.uniform(-p['brightness'], p['brightness'])
+        # beta = random.uniform(-p['brightness']*50, p['brightness']*50)
+        # img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+        #
+        # if random.random() < p['noise_p']:
+        #     noise = np.random.randn(h, w, 3) * 25
+        #     img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
         quad_imgs.append(img)
         quad_anns.append(anns)
