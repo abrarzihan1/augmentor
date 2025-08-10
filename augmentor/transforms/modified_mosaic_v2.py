@@ -1,472 +1,251 @@
-"""
-Enhanced mosaic generator for YOLO-style datasets.
-
-Features included:
-- Mild per-tile HSV/gamma jitter
-- Tile scale jitter and random overlap when composing the 2x2 mosaic
-- Seam feathering to smooth tile borders
-- Global photometric harmonization after cropping
-- Copy-paste with rotation/scale and feathered alpha + optional LAB color matching
-- Optional GridMask or Cutout
-- Object-centric cropping with fallback to random crop
-
-Inputs expected:
-- images: list of HxWx3 uint8 numpy arrays (BGR as used by OpenCV)
-- annotations: list of arrays/lists of annotations in YOLO format [class, x_center_rel, y_center_rel, w_rel, h_rel]
-- class_freqs: dict mapping class_id -> frequency (for inverse sampling weights)
-
-Returns a tuple (cropped_image, new_annotations_array)
-
-Note: This is a standalone module for offline augmentation. Integrate carefully and validate bbox math when you change tile sizing strategies.
-"""
-
-from typing import List, Tuple, Optional, Dict
 import cv2
 import numpy as np
 import random
 
 
-# --------------------------- Photometric utilities ---------------------------
-
-def random_hsv(img: np.ndarray, hue_delta=8, sat_scale=0.12, val_scale=0.12) -> np.ndarray:
-    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h = img_hsv[..., 0]
-    s = img_hsv[..., 1]
-    v = img_hsv[..., 2]
-
-    dh = random.uniform(-hue_delta, hue_delta)
-    ds = 1.0 + random.uniform(-sat_scale, sat_scale)
-    dv = 1.0 + random.uniform(-val_scale, val_scale)
-
-    h = (h + dh) % 180.0
-    s = np.clip(s * ds, 0, 255)
-    v = np.clip(v * dv, 0, 255)
-
-    img_hsv[..., 0] = h
-    img_hsv[..., 1] = s
-    img_hsv[..., 2] = v
-    return cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-
-def random_gamma(img: np.ndarray, gamma_range=(0.85, 1.25)) -> np.ndarray:
-    g = random.uniform(*gamma_range)
-    inv = 1.0 / g
-    table = (np.arange(256) / 255.0) ** inv * 255.0
-    table = np.clip(table, 0, 255).astype(np.uint8)
-    return cv2.LUT(img, table)
-
-
-def maybe_blur_or_sharpen(img: np.ndarray, p_blur=0.12, p_sharp=0.05) -> np.ndarray:
-    r = random.random()
-    if r < p_blur:
-        k = random.choice([3, 5])
-        return cv2.GaussianBlur(img, (k, k), 0)
-    elif r < p_blur + p_sharp:
-        blur = cv2.GaussianBlur(img, (3, 3), 1)
-        return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
-    return img
-
-
-def add_noise(img: np.ndarray, noise_p=0.06) -> np.ndarray:
-    if random.random() >= noise_p:
-        return img
-    r = random.random()
-    out = img.astype(np.float32)
-    if r < 0.6:
-        sigma = random.uniform(3, 14)
-        noise = np.random.randn(*img.shape) * sigma
-        out = out + noise
-        return np.clip(out, 0, 255).astype(np.uint8)
-    else:
-        # mild salt and pepper
-        prob = random.uniform(0.0005, 0.006)
-        mask = np.random.choice([0, 1, 2], size=img.shape[:2], p=[1 - prob, prob / 2, prob / 2])
-        out = img.copy()
-        out[mask == 1] = 0
-        out[mask == 2] = 255
-        return out
-
-
-def global_photometric(img: np.ndarray, prob=1.0) -> np.ndarray:
-    if random.random() > prob:
-        return img
-    out = img.copy()
-    out = random_hsv(out, hue_delta=6, sat_scale=0.10, val_scale=0.10)
-    out = random_gamma(out, gamma_range=(0.9, 1.15))
-    out = maybe_blur_or_sharpen(out, p_blur=0.10, p_sharp=0.04)
-    out = add_noise(out, noise_p=0.04)
-    if random.random() < 0.08:
-        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        lab = cv2.merge([l, a, b])
-        out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    return out
-
-
-# --------------------------- Copy-paste utilities ---------------------------
-
-def paste_with_feather(dst: np.ndarray, patch: np.ndarray, px: int, py: int, feather: int = 8,
-                       color_match: bool = True) -> np.ndarray:
-    h, w = patch.shape[:2]
-    H, W = dst.shape[:2]
-    if h == 0 or w == 0:
-        return dst
-    if px < 0 or py < 0 or px + w > W or py + h > H:
-        return dst  # skip out-of-bounds
-
-    # color match in LAB space (match mean and std)
-    dst_region = dst[py:py + h, px:px + w]
-    patch_f = patch.astype(np.float32)
-    dst_f = dst_region.astype(np.float32)
-
-    if color_match:
-        patch_lab = cv2.cvtColor(patch.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
-        dst_lab = cv2.cvtColor(dst_region.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
-        for c in range(3):
-            pm = patch_lab[..., c].mean()
-            ps = patch_lab[..., c].std() + 1e-6
-            dm = dst_lab[..., c].mean()
-            ds = dst_lab[..., c].std() + 1e-6
-            patch_lab[..., c] = (patch_lab[..., c] - pm) * (ds / ps) + dm
-        patch_f = cv2.cvtColor(np.clip(patch_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
-
-    # create alpha mask with feather edges
-    alpha = np.ones((h, w), dtype=np.float32)
-    if feather > 0:
-        ys, xs = np.ogrid[:h, :w]
-        dist = np.minimum(np.minimum(xs, w - 1 - xs), np.minimum(ys, h - 1 - ys)).astype(np.float32)
-        alpha = np.clip(dist / float(feather), 0.0, 1.0)
-
-    alpha = alpha[..., None]
-    blended = (patch_f * alpha + dst_f * (1.0 - alpha)).astype(np.uint8)
-    out = dst.copy()
-    out[py:py + h, px:px + w] = blended
-    return out
-
-
-# --------------------------- Seam blending ---------------------------
-
-def blend_seams(canvas: np.ndarray, tile_w: int, tile_h: int, seam_width: int = 12) -> np.ndarray:
-    H, W = canvas.shape[:2]
-    out = canvas.copy().astype(np.float32)
-    # vertical seam at x = tile_w
-    for dx in range(-seam_width, seam_width):
-        alpha = (dx + seam_width) / (2.0 * seam_width)
-        x = tile_w + dx
-        if x <= 0 or x >= W - 1:
-            continue
-        left = canvas[:, x - 1, :].astype(np.float32)
-        right = canvas[:, x, :].astype(np.float32)
-        out[:, x, :] = left * (1 - alpha) + right * alpha
-    # horizontal seam at y = tile_h
-    for dy in range(-seam_width, seam_width):
-        alpha = (dy + seam_width) / (2.0 * seam_width)
-        y = tile_h + dy
-        if y <= 0 or y >= H - 1:
-            continue
-        top = canvas[y - 1, :, :].astype(np.float32)
-        bottom = canvas[y, :, :].astype(np.float32)
-        out[y, :, :] = top * (1 - alpha) + bottom * alpha
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-# --------------------------- GridMask / Cutout ---------------------------
-
-def apply_gridmask(img: np.ndarray, grid_ratio=0.7) -> np.ndarray:
-    h, w = img.shape[:2]
-    d = int(max(8, w * grid_ratio))
-    mask = np.ones((h, w), dtype=np.uint8)
-    top = random.randint(0, max(0, d - 1))
-    left = random.randint(0, max(0, d - 1))
-    for y in range(-d, h, d * 2):
-        for x in range(-d, w, d * 2):
-            y1 = y + top
-            x1 = x + left
-            mask[max(0, y1):min(h, y1 + d), max(0, x1):min(w, x1 + d)] = 0
-    masked = cv2.bitwise_and(img, img, mask=mask)
-    return masked
-
-
-# --------------------------- Main enhanced mosaic ---------------------------
-
-def enhanced_mosaic_v2(
-    images: List[np.ndarray],
-    annotations: List[np.ndarray],
-    class_freqs: Dict[int, float],
-    extra_images: Optional[List[np.ndarray]] = None,
-    extra_annotations: Optional[List[np.ndarray]] = None,
-    tile_size: int = 640,
-    crop_offset: float = 0.15,
-    copy_paste_prob: float = 0.45,
-    gridmask_prob: float = 0.25,
-    grid_ratio: float = 0.6,
-    max_retry: int = 8,
-    seed: Optional[int] = None,
-    allow_overlap: bool = True,
-    seam_width: int = 12,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate one enhanced mosaic image + annotations.
-
-    Returns: cropped_img (tile_size x tile_size x 3), new_anns (N x 5) in YOLO format
+def mosaic(images, annotations, output_size=(640, 640), crop_offset=0.15):
     """
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
+    Applies mosaic augmentation by randomly selecting 4, 6, or 9 images from the input.
+    Images are cropped around object centers and scaled to fit perfectly in the output size.
 
-    N_images = len(images)
-    if N_images == 0:
-        raise ValueError("no images provided")
+    Args:
+        images (List[np.ndarray]): List of 9 images as numpy arrays.
+        annotations (List[np.ndarray]): List of 9 annotation arrays corresponding to images.
+        output_size (tuple): Output image size (width, height).
+        crop_offset (float): Max crop offset for random cropping around center.
 
-    # 1. Sampling weights (inverse class freq if objects exist)
-    weights = []
-    for anns in annotations:
-        if len(anns):
-            w = np.mean([1.0 / (class_freqs.get(int(a[0]), 1.0)) for a in anns])
-        else:
-            w = 1.0
-        weights.append(w)
-    weights = np.array(weights, dtype=np.float64)
-    if weights.sum() <= 0:
-        weights = np.ones_like(weights)
-    weights = weights / weights.sum()
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Augmented image and updated annotations.
+    """
+    assert len(images) == 9, "Input must contain exactly 9 images."
+    assert len(annotations) == 9, "Input must contain exactly 9 annotation sets."
 
-    # choose 4 indices without replacement (if less than 4 images, allow replacement)
-    replace = (N_images < 4)
-    idxs = np.random.choice(N_images, size=4, replace=replace, p=weights)
+    # Randomly choose how many images to use
+    num_images_options = [4, 6, 9]
+    num_images = random.choice(num_images_options)
 
-    # 2. prepare a canvas (2x2 tiles)
-    tile_w, tile_h = tile_size, tile_size
-    canvas_h = tile_h * 2
-    canvas_w = tile_w * 2
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    # Randomly select images and their corresponding annotations
+    selected_indices = random.sample(range(9), num_images)
+    selected_images = [images[i] for i in selected_indices]
+    selected_annotations = [annotations[i] for i in selected_indices]
 
-    offsets = []
-    quad_abs_ann = []  # absolute bbox entries: (cls, cx_abs, cy_abs, w_abs, h_abs)
+    # Determine grid dimensions
+    if num_images == 4:
+        grid_rows, grid_cols = 2, 2
+    elif num_images == 6:
+        grid_rows, grid_cols = 2, 3
+    elif num_images == 9:
+        grid_rows, grid_cols = 3, 3
 
-    # optional random overlap offsets per quadrant
-    for i, idx in enumerate(idxs):
-        src = images[idx]
-        anns = annotations[idx]
-        ih, iw = src.shape[:2]
+    w, h = output_size
 
-        # scale jitter (random scale) and optional rotation
-        scale = random.uniform(0.7, 1.3)
-        new_w = max(2, int(iw * scale))
-        new_h = max(2, int(ih * scale))
-        src_scaled = cv2.resize(src, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Calculate cell size (each image's final size in the mosaic)
+    cell_width = w // grid_cols
+    cell_height = h // grid_rows
 
-        # choose a crop region from scaled image to fill tile (allow partial)
-        if new_w > tile_w:
-            xoff = random.randint(0, new_w - tile_w)
-        else:
-            xoff = 0
-        if new_h > tile_h:
-            yoff = random.randint(0, new_h - tile_h)
-        else:
-            yoff = 0
+    # Process each selected image: crop around object center and resize
+    processed_images = []
+    processed_annotations = []
 
-        tile_img = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
-        tile_img[:min(tile_h, new_h - yoff), :min(tile_w, new_w - xoff)] = \
-            src_scaled[yoff:yoff + min(tile_h, new_h - yoff), xoff:xoff + min(tile_w, new_w - xoff)]
+    for img, anns in zip(selected_images, selected_annotations):
+        cropped_img, cropped_anns = _crop_around_object_center(img, anns, (cell_width, cell_height))
+        processed_images.append(cropped_img)
+        processed_annotations.append(cropped_anns)
 
-        # per-tile mild photometric jitter
-        if random.random() < 0.9:
-            tile_img = random_hsv(tile_img, hue_delta=6, sat_scale=0.08, val_scale=0.08)
-        if random.random() < 0.25:
-            tile_img = random_gamma(tile_img, gamma_range=(0.95, 1.08))
-        if random.random() < 0.08:
-            tile_img = add_noise(tile_img, noise_p=0.5)
+    # Create mosaic canvas with exact output size
+    mosaic_canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # compute where to place this tile in canvas
-        base_x = (i % 2) * tile_w
-        base_y = (i // 2) * tile_h
-        if allow_overlap:
-            # small random offsets to allow overlap/cross-tile objects
-            ox = int(random.uniform(-0.18, 0.18) * tile_w)
-            oy = int(random.uniform(-0.18, 0.18) * tile_h)
-        else:
-            ox = oy = 0
-        place_x = max(0, min(canvas_w - tile_w, base_x + ox))
-        place_y = max(0, min(canvas_h - tile_h, base_y + oy))
+    # Calculate positions for each image in the grid
+    positions = []
+    for row in range(grid_rows):
+        for col in range(grid_cols):
+            x_offset = col * cell_width
+            y_offset = row * cell_height
+            positions.append((x_offset, y_offset))
 
-        # paste tile onto canvas (hard paste here; seams will be blended later)
-        canvas[place_y:place_y + tile_h, place_x:place_x + tile_w] = tile_img
-        offsets.append((place_x, place_y, new_w, new_h, xoff, yoff, iw, ih))
+    # Place processed images on canvas
+    for i in range(num_images):
+        x_off, y_off = positions[i]
+        # Ensure we don't exceed canvas boundaries
+        end_x = min(x_off + cell_width, w)
+        end_y = min(y_off + cell_height, h)
+        actual_width = end_x - x_off
+        actual_height = end_y - y_off
 
-        # convert YOLO annotations to absolute coordinates in the canvas
-        for a in anns:
-            cls = int(a[0])
-            x_c_rel, y_c_rel, bw_rel, bh_rel = float(a[1]), float(a[2]), float(a[3]), float(a[4])
-            # original absolute in src_scaled
-            # convert original rel coords (in original image) to pixel in scaled image
-            ax = (x_c_rel * iw - xoff) * scale
-            ay = (y_c_rel * ih - yoff) * scale
-            a_w = bw_rel * iw * scale
-            a_h = bh_rel * ih * scale
-            # position in canvas
-            abs_x = ax + place_x
-            abs_y = ay + place_y
-            # store
-            quad_abs_ann.append((cls, abs_x, abs_y, a_w, a_h))
+        # Place the image, cropping if necessary to fit exactly
+        img_to_place = processed_images[i][:actual_height, :actual_width]
+        mosaic_canvas[y_off:end_y, x_off:end_x] = img_to_place
 
-    # 3. seam blending
-    canvas = blend_seams(canvas, tile_w, tile_h, seam_width=seam_width)
+    # Apply random offset cropping to the entire mosaic
+    final_image, final_annotations = _apply_random_crop(
+        mosaic_canvas, processed_annotations, positions,
+        cell_width, cell_height, output_size, crop_offset
+    )
 
-    # 4. object-centric or random crop
-    chosen_keep = []
-    x0 = y0 = 0
-    for _ in range(max_retry):
-        dx = int(random.uniform(-crop_offset, crop_offset) * tile_w)
-        dy = int(random.uniform(-crop_offset, crop_offset) * tile_h)
-        cx = tile_w + dx
-        cy = tile_h + dy
-        x0 = max(0, min(cx - tile_w // 2, canvas_w - tile_w))
-        y0 = max(0, min(cy - tile_h // 2, canvas_h - tile_h))
+    return final_image, final_annotations
 
-        keep = []
-        for (cls, ax, ay, aw, ah) in quad_abs_ann:
-            if (x0 < ax < x0 + tile_w) and (y0 < ay < y0 + tile_h):
-                keep.append((cls, ax, ay, aw, ah))
-        # sometimes allow empty keep -> fallback to random crop
-        if keep and random.random() < 0.9:
-            chosen_keep = keep
-            break
-        elif not keep and random.random() < 0.3:
-            chosen_keep = []
-            break
-    if not chosen_keep and len(quad_abs_ann) > 0:
-        # fallback: pick any object and center on it
-        obj = random.choice(quad_abs_ann)
-        _, ax, ay, _, _ = obj
-        x0 = int(max(0, min(ax - tile_w // 2, canvas_w - tile_w)))
-        y0 = int(max(0, min(ay - tile_h // 2, canvas_h - tile_h)))
-        chosen_keep = [o for o in quad_abs_ann if (x0 < o[1] < x0 + tile_w and y0 < o[2] < y0 + tile_h)]
 
-    cropped = canvas[y0:y0 + tile_h, x0:x0 + tile_w].copy()
+def _crop_around_object_center(image, annotations, target_size):
+    """
+    Crops an image around a random object's center and resizes to target size.
+    """
+    h_orig, w_orig = image.shape[:2]
+    target_w, target_h = target_size
 
-    # 5. update annotations to new cropped frame (YOLO relative)
-    new_anns = []
-    for (cls, ax, ay, aw, ah) in chosen_keep:
-        x_center = (ax - x0) / float(tile_w)
-        y_center = (ay - y0) / float(tile_h)
-        bw = aw / float(tile_w)
-        bh = ah / float(tile_h)
-        if bw <= 0 or bh <= 0:
-            continue
-        if not (0 < x_center < 1 and 0 < y_center < 1):
-            continue
-        # clip box to image
-        new_anns.append([cls, x_center, y_center, bw, bh])
+    if len(annotations) == 0:
+        # No objects, just resize the entire image
+        resized_img = cv2.resize(image, target_size)
+        return resized_img, annotations
 
-    # 6. optional GridMask
-    if random.random() < gridmask_prob and len(new_anns) > 0:
-        if random.random() < 0.5:
-            cropped = apply_gridmask(cropped, grid_ratio=grid_ratio)
-        else:
-            # simple cutout alternative: random rectangles
-            for _ in range(random.randint(1, 3)):
-                rw = random.randint(int(0.05 * tile_w), int(0.3 * tile_w))
-                rh = random.randint(int(0.05 * tile_h), int(0.3 * tile_h))
-                rx = random.randint(0, tile_w - rw)
-                ry = random.randint(0, tile_h - rh)
-                cropped[ry:ry + rh, rx:rx + rw] = 0
-        # remove boxes heavily covered by mask (approx)
-        kept = []
-        for ann in new_anns:
-            cls, x_c, y_c, bw, bh = ann
-            cx = int(x_c * tile_w)
-            cy = int(y_c * tile_h)
-            box_w = max(1, int(bw * tile_w / 2))
-            box_h = max(1, int(bh * tile_h / 2))
-            x0b = max(0, cx - box_w)
-            y0b = max(0, cy - box_h)
-            x1b = min(tile_w, cx + box_w)
-            y1b = min(tile_h, cy + box_h)
-            patch = cropped[y0b:y1b, x0b:x1b]
-            if patch.size == 0:
-                continue
-            # visible ratio heuristic: fraction of non-black pixels
-            visible_ratio = np.count_nonzero(np.any(patch != 0, axis=-1)) / float(max(1, patch.shape[0] * patch.shape[1]))
-            if visible_ratio > 0.25:
-                kept.append(ann)
-        new_anns = kept
+    # Select a random object to center around
+    random_ann = annotations[random.randint(0, len(annotations) - 1)]
+    _, center_x_norm, center_y_norm, _, _ = random_ann
 
-    # 7. Copy-paste small objects (feathered + optional rotation/scale)
-    if extra_images and extra_annotations and random.random() < copy_paste_prob and len(extra_annotations) > 0:
-        ei = random.randrange(len(extra_images))
-        src = extra_images[ei]
-        eanns = extra_annotations[ei]
-        if len(eanns) > 0 and len(new_anns) < 12:
-            # paste 1..3 objects
-            for _ in range(random.randint(1, 3)):
-                a = random.choice(eanns)
-                cls, x_c, y_c, bw, bh = int(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[4])
-                ih, iw = src.shape[:2]
-                x0o = int((x_c - bw / 2) * iw)
-                y0o = int((y_c - bh / 2) * ih)
-                w_obj = max(2, int(bw * iw))
-                h_obj = max(2, int(bh * ih))
-                if x0o < 0 or y0o < 0 or x0o + w_obj > iw or y0o + h_obj > ih:
-                    continue
-                patch = src[y0o:y0o + h_obj, x0o:x0o + w_obj].copy()
-                # random scale/rotate patch
-                scale_p = random.uniform(0.6, 1.2)
-                pw = max(1, int(patch.shape[1] * scale_p))
-                ph = max(1, int(patch.shape[0] * scale_p))
-                patch = cv2.resize(patch, (pw, ph), interpolation=cv2.INTER_LINEAR)
-                if random.random() < 0.35:
-                    angle = random.uniform(-25, 25)
-                    M = cv2.getRotationMatrix2D((pw // 2, ph // 2), angle, 1.0)
-                    patch = cv2.warpAffine(patch, M, (pw, ph), borderMode=cv2.BORDER_REFLECT)
-                px = random.randint(0, tile_w - patch.shape[1])
-                py = random.randint(0, tile_h - patch.shape[0])
-                cropped = paste_with_feather(cropped, patch, px, py, feather=8, color_match=True)
-                new_anns.append([cls, (px + patch.shape[1] / 2) / tile_w, (py + patch.shape[0] / 2) / tile_h,
-                                 patch.shape[1] / tile_w, patch.shape[0] / tile_h])
+    # Convert to pixel coordinates
+    center_x = int(center_x_norm * w_orig)
+    center_y = int(center_y_norm * h_orig)
 
-    # 8. final global photometric harmonization
-    cropped = global_photometric(cropped, prob=1.0)
+    # Calculate crop size to maintain aspect ratio
+    aspect_ratio = target_w / target_h
+    orig_aspect_ratio = w_orig / h_orig
 
-    # 9. final sanitation: clip small boxes, ensure numeric types
-    final_anns = []
-    for ann in new_anns:
-        cls, x_c, y_c, bw, bh = ann
-        # discard boxes too small or out of range
-        if bw <= 0 or bh <= 0:
-            continue
-        if bw * tile_w < 6 or bh * tile_h < 6:
-            continue
-        if not (0 < x_c < 1 and 0 < y_c < 1):
-            continue
-        final_anns.append([int(cls), float(x_c), float(y_c), float(bw), float(bh)])
-
-    if len(final_anns) == 0:
-        final_anns = np.zeros((0, 5), dtype=np.float32)
+    if orig_aspect_ratio > aspect_ratio:
+        # Original is wider, crop width
+        crop_height = h_orig
+        crop_width = int(crop_height * aspect_ratio)
     else:
-        final_anns = np.array(final_anns, dtype=np.float32)
+        # Original is taller, crop height
+        crop_width = w_orig
+        crop_height = int(crop_width / aspect_ratio)
 
-    return cropped, final_anns
+    # Calculate crop boundaries centered on the object
+    crop_x1 = max(0, center_x - crop_width // 2)
+    crop_y1 = max(0, center_y - crop_height // 2)
+    crop_x2 = min(w_orig, crop_x1 + crop_width)
+    crop_y2 = min(h_orig, crop_y1 + crop_height)
+
+    # Adjust if crop goes out of bounds
+    if crop_x2 - crop_x1 < crop_width:
+        crop_x1 = max(0, crop_x2 - crop_width)
+    if crop_y2 - crop_y1 < crop_height:
+        crop_y1 = max(0, crop_y2 - crop_height)
+
+    # Crop the image
+    cropped_img = image[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    # Resize to target size
+    resized_img = cv2.resize(cropped_img, target_size)
+
+    # Update annotations
+    crop_w = crop_x2 - crop_x1
+    crop_h = crop_y2 - crop_y1
+    updated_annotations = []
+
+    for ann in annotations:
+        class_id, x_norm, y_norm, bw_norm, bh_norm = ann
+
+        # Convert to absolute coordinates in original image
+        abs_x = x_norm * w_orig
+        abs_y = y_norm * h_orig
+        abs_bw = bw_norm * w_orig
+        abs_bh = bh_norm * h_orig
+
+        # Adjust for crop offset
+        new_abs_x = abs_x - crop_x1
+        new_abs_y = abs_y - crop_y1
+
+        # Calculate bounding box in cropped image
+        x1 = new_abs_x - abs_bw / 2
+        y1 = new_abs_y - abs_bh / 2
+        x2 = new_abs_x + abs_bw / 2
+        y2 = new_abs_y + abs_bh / 2
+
+        # Clip to crop boundaries
+        x1 = max(0, min(crop_w, x1))
+        y1 = max(0, min(crop_h, y1))
+        x2 = max(0, min(crop_w, x2))
+        y2 = max(0, min(crop_h, y2))
+
+        # Skip if bounding box is invalid
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        # Convert to normalized coordinates in cropped/resized image
+        new_center_x = (x1 + x2) / 2 / crop_w
+        new_center_y = (y1 + y2) / 2 / crop_h
+        new_bw = (x2 - x1) / crop_w
+        new_bh = (y2 - y1) / crop_h
+
+        updated_annotations.append([int(class_id), new_center_x, new_center_y, new_bw, new_bh])
+
+    return resized_img, np.array(updated_annotations)
 
 
-# --------------------------- Simple test helper ---------------------------
+def _apply_random_crop(mosaic_image, all_annotations, positions, cell_width, cell_height, output_size, crop_offset):
+    """
+    Applies random cropping to the entire mosaic and updates annotations accordingly.
+    """
+    mosaic_h, mosaic_w = mosaic_image.shape[:2]
+    out_w, out_h = output_size
 
-def draw_yolo_boxes(img: np.ndarray, anns: np.ndarray, class_colors: Optional[Dict[int, Tuple[int, int, int]]] = None) -> np.ndarray:
-    out = img.copy()
-    h, w = out.shape[:2]
-    for a in anns:
-        cls, xc, yc, bw, bh = int(a[0]), a[1], a[2], a[3], a[4]
-        x = int((xc - bw / 2) * w)
-        y = int((yc - bh / 2) * h)
-        ww = int(bw * w)
-        hh = int(bh * h)
-        color = (0, 255, 0) if class_colors is None else class_colors.get(cls, (0, 255, 0))
-        cv2.rectangle(out, (x, y), (x + ww, y + hh), color, 2)
-        cv2.putText(out, str(cls), (x, max(0, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    return out
+    # Apply minimal random offset for augmentation
+    max_offset_x = int(crop_offset * out_w * 0.1)  # Small offset since images already fit
+    max_offset_y = int(crop_offset * out_h * 0.1)
 
+    offset_x = random.randint(-max_offset_x, max_offset_x)
+    offset_y = random.randint(-max_offset_y, max_offset_y)
 
-if __name__ == '__main__':
-    # quick sanity check (user should provide dataset to actually run)
-    print('enhanced_mosaic_v2.py loaded. Integrate enhanced_mosaic_v2(images, annotations, class_freqs, ...)')
+    # Create slightly larger canvas to allow for offset
+    padded_canvas = np.zeros((mosaic_h + 2 * max_offset_y, mosaic_w + 2 * max_offset_x, 3), dtype=np.uint8)
+    padded_canvas[max_offset_y:max_offset_y + mosaic_h, max_offset_x:max_offset_x + mosaic_w] = mosaic_image
+
+    # Crop with offset
+    crop_x = max_offset_x + offset_x
+    crop_y = max_offset_y + offset_y
+    final_image = padded_canvas[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
+
+    # Update annotations with offset
+    final_annotations = []
+    for i, anns in enumerate(all_annotations):
+        if i >= len(positions):
+            continue
+
+        cell_x_off, cell_y_off = positions[i]
+
+        for ann in anns:
+            class_id, x_norm, y_norm, bw_norm, bh_norm = ann
+
+            # Convert to absolute coordinates in mosaic
+            abs_x = x_norm * cell_width + cell_x_off
+            abs_y = y_norm * cell_height + cell_y_off
+            abs_bw = bw_norm * cell_width
+            abs_bh = bh_norm * cell_height
+
+            # Apply offset
+            new_abs_x = abs_x - offset_x
+            new_abs_y = abs_y - offset_y
+
+            # Calculate bounding box
+            x1 = new_abs_x - abs_bw / 2
+            y1 = new_abs_y - abs_bh / 2
+            x2 = new_abs_x + abs_bw / 2
+            y2 = new_abs_y + abs_bh / 2
+
+            # Clip to output boundaries
+            x1 = max(0, min(out_w, x1))
+            y1 = max(0, min(out_h, y1))
+            x2 = max(0, min(out_w, x2))
+            y2 = max(0, min(out_h, y2))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Convert back to normalized coordinates
+            new_center_x = (x1 + x2) / 2 / out_w
+            new_center_y = (y1 + y2) / 2 / out_h
+            new_bw = (x2 - x1) / out_w
+            new_bh = (y2 - y1) / out_h
+
+            final_annotations.append([int(class_id), new_center_x, new_center_y, new_bw, new_bh])
+
+    return final_image, np.array(final_annotations)
