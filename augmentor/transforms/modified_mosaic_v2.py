@@ -3,249 +3,120 @@ import numpy as np
 import random
 
 
-def mosaic(images, annotations, output_size=(640, 640), crop_offset=0.15):
+def mosaic(images, annotations, output_size=(640, 640)):
     """
-    Applies mosaic augmentation by randomly selecting 4, 6, or 9 images from the input.
-    Images are cropped around object centers and scaled to fit perfectly in the output size.
+    Creates a mosaic by randomly selecting 4, 6, or 9 images from a list of 9.
+    Each tile in the mosaic is a crop centered on a random object from its source image.
 
     Args:
-        images (List[np.ndarray]): List of 9 images as numpy arrays.
-        annotations (List[np.ndarray]): List of 9 annotation arrays corresponding to images.
-        output_size (tuple): Output image size (width, height).
-        crop_offset (float): Max crop offset for random cropping around center.
+        images (List[np.ndarray]): A list of 9 input images as numpy arrays.
+        annotations (List[np.ndarray]): A list of 9 annotation arrays.
+                                       Each annotation is [class_id, cx, cy, w, h] in normalized format.
+        output_size (tuple): The final size of the mosaic image (width, height).
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: Augmented image and updated annotations.
+        Tuple[np.ndarray, np.ndarray]: The final mosaic image and its corresponding annotations.
     """
-    assert len(images) == 9, "Input must contain exactly 9 images."
-    assert len(annotations) == 9, "Input must contain exactly 9 annotation sets."
+    # Ensure exactly 9 images and annotations are provided
+    assert len(images) == 9, "This function requires a list of exactly 9 images."
+    assert len(annotations) == 9, "This function requires a list of exactly 9 annotation sets."
 
-    # Randomly choose how many images to use
-    num_images_options = [4, 6, 9]
-    num_images = random.choice(num_images_options)
+    # Randomly choose the number of images to use for the mosaic
+    n = random.choice([4, 6, 9])
 
-    # Randomly select images and their corresponding annotations
-    selected_indices = random.sample(range(9), num_images)
-    selected_images = [images[i] for i in selected_indices]
-    selected_annotations = [annotations[i] for i in selected_indices]
+    # Randomly select n images and their corresponding annotations
+    indices = random.sample(range(9), n)
+    selected_images = [images[i] for i in indices]
+    selected_annotations = [annotations[i] for i in indices]
 
-    # Determine grid dimensions
-    if num_images == 4:
-        grid_rows, grid_cols = 2, 2
-    elif num_images == 6:
-        grid_rows, grid_cols = 2, 3
-    elif num_images == 9:
-        grid_rows, grid_cols = 3, 3
+    output_w, output_h = output_size
 
-    w, h = output_size
+    # Determine the grid layout based on the number of selected images
+    if n == 4:
+        grid_w, grid_h = 2, 2
+    elif n == 6:
+        grid_w, grid_h = 3, 2
+    else:  # n == 9
+        grid_w, grid_h = 3, 3
 
-    # Calculate cell size (each image's final size in the mosaic)
-    cell_width = w // grid_cols
-    cell_height = h // grid_rows
+    tile_w = output_w // grid_w
+    tile_h = output_h // grid_h
 
-    # Process each selected image: crop around object center and resize
-    processed_images = []
-    processed_annotations = []
-
-    for img, anns in zip(selected_images, selected_annotations):
-        cropped_img, cropped_anns = _crop_around_object_center(img, anns, (cell_width, cell_height))
-        processed_images.append(cropped_img)
-        processed_annotations.append(cropped_anns)
-
-    # Create mosaic canvas with exact output size
-    mosaic_canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-    # Calculate positions for each image in the grid
-    positions = []
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            x_offset = col * cell_width
-            y_offset = row * cell_height
-            positions.append((x_offset, y_offset))
-
-    # Place processed images on canvas
-    for i in range(num_images):
-        x_off, y_off = positions[i]
-        # Ensure we don't exceed canvas boundaries
-        end_x = min(x_off + cell_width, w)
-        end_y = min(y_off + cell_height, h)
-        actual_width = end_x - x_off
-        actual_height = end_y - y_off
-
-        # Place the image, cropping if necessary to fit exactly
-        img_to_place = processed_images[i][:actual_height, :actual_width]
-        mosaic_canvas[y_off:end_y, x_off:end_x] = img_to_place
-
-    # Apply random offset cropping to the entire mosaic
-    final_image, final_annotations = _apply_random_crop(
-        mosaic_canvas, processed_annotations, positions,
-        cell_width, cell_height, output_size, crop_offset
-    )
-
-    return final_image, final_annotations
-
-
-def _crop_around_object_center(image, annotations, target_size):
-    """
-    Crops an image around a random object's center and resizes to target size.
-    """
-    h_orig, w_orig = image.shape[:2]
-    target_w, target_h = target_size
-
-    if len(annotations) == 0:
-        # No objects, just resize the entire image
-        resized_img = cv2.resize(image, target_size)
-        return resized_img, annotations
-
-    # Select a random object to center around
-    random_ann = annotations[random.randint(0, len(annotations) - 1)]
-    _, center_x_norm, center_y_norm, _, _ = random_ann
-
-    # Convert to pixel coordinates
-    center_x = int(center_x_norm * w_orig)
-    center_y = int(center_y_norm * h_orig)
-
-    # Calculate crop size to maintain aspect ratio
-    aspect_ratio = target_w / target_h
-    orig_aspect_ratio = w_orig / h_orig
-
-    if orig_aspect_ratio > aspect_ratio:
-        # Original is wider, crop width
-        crop_height = h_orig
-        crop_width = int(crop_height * aspect_ratio)
-    else:
-        # Original is taller, crop height
-        crop_width = w_orig
-        crop_height = int(crop_width / aspect_ratio)
-
-    # Calculate crop boundaries centered on the object
-    crop_x1 = max(0, center_x - crop_width // 2)
-    crop_y1 = max(0, center_y - crop_height // 2)
-    crop_x2 = min(w_orig, crop_x1 + crop_width)
-    crop_y2 = min(h_orig, crop_y1 + crop_height)
-
-    # Adjust if crop goes out of bounds
-    if crop_x2 - crop_x1 < crop_width:
-        crop_x1 = max(0, crop_x2 - crop_width)
-    if crop_y2 - crop_y1 < crop_height:
-        crop_y1 = max(0, crop_y2 - crop_height)
-
-    # Crop the image
-    cropped_img = image[crop_y1:crop_y2, crop_x1:crop_x2]
-
-    # Resize to target size
-    resized_img = cv2.resize(cropped_img, target_size)
-
-    # Update annotations
-    crop_w = crop_x2 - crop_x1
-    crop_h = crop_y2 - crop_y1
-    updated_annotations = []
-
-    for ann in annotations:
-        class_id, x_norm, y_norm, bw_norm, bh_norm = ann
-
-        # Convert to absolute coordinates in original image
-        abs_x = x_norm * w_orig
-        abs_y = y_norm * h_orig
-        abs_bw = bw_norm * w_orig
-        abs_bh = bh_norm * h_orig
-
-        # Adjust for crop offset
-        new_abs_x = abs_x - crop_x1
-        new_abs_y = abs_y - crop_y1
-
-        # Calculate bounding box in cropped image
-        x1 = new_abs_x - abs_bw / 2
-        y1 = new_abs_y - abs_bh / 2
-        x2 = new_abs_x + abs_bw / 2
-        y2 = new_abs_y + abs_bh / 2
-
-        # Clip to crop boundaries
-        x1 = max(0, min(crop_w, x1))
-        y1 = max(0, min(crop_h, y1))
-        x2 = max(0, min(crop_w, x2))
-        y2 = max(0, min(crop_h, y2))
-
-        # Skip if bounding box is invalid
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        # Convert to normalized coordinates in cropped/resized image
-        new_center_x = (x1 + x2) / 2 / crop_w
-        new_center_y = (y1 + y2) / 2 / crop_h
-        new_bw = (x2 - x1) / crop_w
-        new_bh = (y2 - y1) / crop_h
-
-        updated_annotations.append([int(class_id), new_center_x, new_center_y, new_bw, new_bh])
-
-    return resized_img, np.array(updated_annotations)
-
-
-def _apply_random_crop(mosaic_image, all_annotations, positions, cell_width, cell_height, output_size, crop_offset):
-    """
-    Applies random cropping to the entire mosaic and updates annotations accordingly.
-    """
-    mosaic_h, mosaic_w = mosaic_image.shape[:2]
-    out_w, out_h = output_size
-
-    # Apply minimal random offset for augmentation
-    max_offset_x = int(crop_offset * out_w * 0.1)  # Small offset since images already fit
-    max_offset_y = int(crop_offset * out_h * 0.1)
-
-    offset_x = random.randint(-max_offset_x, max_offset_x)
-    offset_y = random.randint(-max_offset_y, max_offset_y)
-
-    # Create slightly larger canvas to allow for offset
-    padded_canvas = np.zeros((mosaic_h + 2 * max_offset_y, mosaic_w + 2 * max_offset_x, 3), dtype=np.uint8)
-    padded_canvas[max_offset_y:max_offset_y + mosaic_h, max_offset_x:max_offset_x + mosaic_w] = mosaic_image
-
-    # Crop with offset
-    crop_x = max_offset_x + offset_x
-    crop_y = max_offset_y + offset_y
-    final_image = padded_canvas[crop_y:crop_y + out_h, crop_x:crop_x + out_w]
-
-    # Update annotations with offset
+    # Initialize the mosaic canvas with a neutral gray color
+    mosaic_img = np.full((output_h, output_w, 3), 114, dtype=np.uint8)
     final_annotations = []
-    for i, anns in enumerate(all_annotations):
-        if i >= len(positions):
-            continue
 
-        cell_x_off, cell_y_off = positions[i]
+    for i in range(n):
+        img = selected_images[i]
+        anns = selected_annotations[i]
+        img_h, img_w, _ = img.shape
 
+        # 1. Select a center point for the crop
+        if len(anns) > 0:
+            # Randomly choose an object to center the crop on
+            center_ann = random.choice(anns)
+            _, cx_norm, cy_norm, _, _ = center_ann
+            center_x, center_y = int(cx_norm * img_w), int(cy_norm * img_h)
+        else:
+            # If no annotations, crop from the image center
+            center_x, center_y = img_w // 2, img_h // 2
+
+        # 2. Define the crop box based on the tile size
+        x1_crop = center_x - tile_w // 2
+        y1_crop = center_y - tile_h // 2
+
+        # 3. Handle image boundaries and padding
+        # Determine the part of the image to be cropped
+        x1_img_src = max(x1_crop, 0)
+        y1_img_src = max(y1_crop, 0)
+        x2_img_src = min(x1_crop + tile_w, img_w)
+        y2_img_src = min(y1_crop + tile_h, img_h)
+
+        cropped_img = img[y1_img_src:y2_img_src, x1_img_src:x2_img_src]
+
+        # Determine where to place the crop in the padded tile
+        pad_left = -min(0, x1_crop)
+        pad_top = -min(0, y1_crop)
+
+        padded_tile = np.full((tile_h, tile_w, 3), 114, dtype=np.uint8)
+        padded_tile[pad_top:pad_top + cropped_img.shape[0], pad_left:pad_left + cropped_img.shape[1]] = cropped_img
+
+        # 4. Place the completed tile into the main mosaic canvas
+        tile_col = i % grid_w
+        tile_row = i // grid_w
+        x_offset_mosaic = tile_col * tile_w
+        y_offset_mosaic = tile_row * tile_h
+        mosaic_img[y_offset_mosaic:y_offset_mosaic + tile_h, x_offset_mosaic:x_offset_mosaic + tile_w] = padded_tile
+
+        # 5. Adjust and clip annotations for the new mosaic
         for ann in anns:
-            class_id, x_norm, y_norm, bw_norm, bh_norm = ann
+            class_id, cx_n, cy_n, w_n, h_n = ann
 
-            # Convert to absolute coordinates in mosaic
-            abs_x = x_norm * cell_width + cell_x_off
-            abs_y = y_norm * cell_height + cell_y_off
-            abs_bw = bw_norm * cell_width
-            abs_bh = bh_norm * cell_height
+            # Absolute coordinates in the original image
+            abs_cx, abs_cy = cx_n * img_w, cy_n * img_h
+            abs_w, abs_h = w_n * img_w, h_n * img_h
+            abs_x1, abs_y1 = abs_cx - abs_w / 2, abs_cy - abs_h / 2
 
-            # Apply offset
-            new_abs_x = abs_x - offset_x
-            new_abs_y = abs_y - offset_y
+            # Clip bounding box to the cropped tile area
+            new_x1 = max(0, abs_x1 - x1_crop)
+            new_y1 = max(0, abs_y1 - y1_crop)
+            new_x2 = min(tile_w, abs_x1 + abs_w - x1_crop)
+            new_y2 = min(tile_h, abs_y1 + abs_h - y1_crop)
 
-            # Calculate bounding box
-            x1 = new_abs_x - abs_bw / 2
-            y1 = new_abs_y - abs_bh / 2
-            x2 = new_abs_x + abs_bw / 2
-            y2 = new_abs_y + abs_bh / 2
+            new_w, new_h = new_x2 - new_x1, new_y2 - new_y1
 
-            # Clip to output boundaries
-            x1 = max(0, min(out_w, x1))
-            y1 = max(0, min(out_h, y1))
-            x2 = max(0, min(out_w, x2))
-            y2 = max(0, min(out_h, y2))
+            if new_w > 0 and new_h > 0:
+                # Calculate new center and dimensions relative to the final mosaic
+                final_cx = new_x1 + new_w / 2 + x_offset_mosaic
+                final_cy = new_y1 + new_h / 2 + y_offset_mosaic
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+                # Normalize coordinates for the final output
+                final_cx_norm = final_cx / output_w
+                final_cy_norm = final_cy / output_h
+                final_w_norm = new_w / output_w
+                final_h_norm = new_h / output_h
 
-            # Convert back to normalized coordinates
-            new_center_x = (x1 + x2) / 2 / out_w
-            new_center_y = (y1 + y2) / 2 / out_h
-            new_bw = (x2 - x1) / out_w
-            new_bh = (y2 - y1) / out_h
+                final_annotations.append([class_id, final_cx_norm, final_cy_norm, final_w_norm, final_h_norm])
 
-            final_annotations.append([int(class_id), new_center_x, new_center_y, new_bw, new_bh])
+    return mosaic_img, np.array(final_annotations)
 
-    return final_image, np.array(final_annotations)
