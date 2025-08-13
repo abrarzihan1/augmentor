@@ -3,40 +3,102 @@ import numpy as np
 import random
 
 
-def random_hsv(image, h_gain=0.01, s_gain=0.6, v_gain=0.4, prob=0.5):
+def random_flip(image, annotations, prob=0.5):
     """
-    Applies random HSV color augmentation to an image with a given probability.
+    Applies a random horizontal flip to an image and its annotations.
 
     Args:
-        image (np.ndarray): The input image in BGR format.
-        h_gain (float): The maximum hue gain.
-        s_gain (float): The maximum saturation gain.
-        v_gain (float): The maximum value gain.
-        prob (float): The probability of applying the augmentation.
+        image (np.ndarray): The input image.
+        annotations (np.ndarray): The corresponding annotations.
+        prob (float): The probability of applying the flip.
 
     Returns:
-        np.ndarray: The augmented image.
+        Tuple[np.ndarray, np.ndarray]: The potentially flipped image and adjusted annotations.
     """
     if random.random() < prob:
-        # Generate random HSV gains
-        r = np.random.uniform(-1, 1, 3) * [h_gain, s_gain, v_gain] + 1
+        image = np.fliplr(image)
+        if len(annotations) > 0:
+            # For YOLO format [class, cx, cy, w, h], only cx needs to be adjusted
+            annotations[:, 1] = 1.0 - annotations[:, 1]
+    return image, annotations
 
-        # Convert image to HSV and apply gains
-        hue, sat, val = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2HSV))
-        dtype = image.dtype
 
-        x = np.arange(0, 256, dtype=r.dtype)
-        lut_hue = ((x * r[0]) % 180).astype(dtype)
-        lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
-        lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+def random_affine(image, annotations, degrees=10, scale=0.1, shear=10, prob=0.5):
+    """
+    Applies random affine transformations (rotation, scale, shear) to an image and its annotations.
 
-        # Apply LUTs to the image channels
-        im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
+    Args:
+        image (np.ndarray): Input image.
+        annotations (np.ndarray): Annotations for the image.
+        degrees (float): Range of random rotation in degrees.
+        scale (float): Range of random scaling.
+        shear (float): Range of random shear in degrees.
+        prob (float): Probability of applying the transformation.
 
-        # Convert back to BGR
-        cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=image)
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The transformed image and annotations.
+    """
+    if random.random() > prob or len(annotations) == 0:
+        return image, annotations
 
-    return image
+    height, width = image.shape[:2]
+
+    # Create the transformation matrix
+    center = (width / 2, height / 2)
+    angle = random.uniform(-degrees, degrees)
+    s = random.uniform(1 - scale, 1 + scale)
+
+    # Combined rotation and scaling matrix
+    rot_matrix = cv2.getRotationMatrix2D(center=center, angle=angle, scale=s)
+
+    # Add shear to the matrix
+    shear_x = random.uniform(-shear, shear)
+    shear_y = random.uniform(-shear, shear)
+    shear_matrix = np.array([[1, -np.tan(np.radians(shear_x)), 0],
+                             [-np.tan(np.radians(shear_y)), 1, 0]])
+
+    # Combine all transformations
+    trans_matrix = shear_matrix @ np.vstack([rot_matrix, [0, 0, 1]])
+    trans_matrix = trans_matrix[:2]
+
+    # Apply the affine transformation to the image
+    image = cv2.warpAffine(image, trans_matrix, (width, height), borderValue=(114, 114, 114))
+
+    # Transform bounding box annotations
+    new_annotations = []
+    for ann in annotations:
+        class_id, cx, cy, w, h = ann
+
+        # Get corner points of the bounding box
+        box_w, box_h = w * width, h * height
+        x1, y1 = (cx * width) - box_w / 2, (cy * height) - box_h / 2
+        x2, y2 = x1 + box_w, y1 + box_h
+        corners = np.array([[x1, y1, 1], [x2, y1, 1], [x1, y2, 1], [x2, y2, 1]]).T
+
+        # Apply the transformation to the corner points
+        transformed_corners = (trans_matrix @ corners).T
+
+        # Get the new axis-aligned bounding box
+        new_x1 = min(transformed_corners[:, 0])
+        new_y1 = min(transformed_corners[:, 1])
+        new_x2 = max(transformed_corners[:, 0])
+        new_y2 = max(transformed_corners[:, 1])
+
+        # Clip to image boundaries
+        new_x1, new_y1 = max(0, new_x1), max(0, new_y1)
+        new_x2, new_y2 = min(width, new_x2), min(height, new_y2)
+
+        # Calculate new width, height, and center
+        new_w = new_x2 - new_x1
+        new_h = new_y2 - new_y1
+
+        # Filter out boxes that are too small or invalid after transform
+        if new_w > 1 and new_h > 1:
+            new_cx = (new_x1 + new_w / 2) / width
+            new_cy = (new_y1 + new_h / 2) / height
+            new_annotations.append([class_id, new_cx, new_cy, new_w / width, new_h / height])
+
+    return image, np.array(new_annotations)
 
 
 def mosaic(
@@ -47,22 +109,31 @@ def mosaic(
         extra_annotations=None,
         copy_paste_prob=0.5,
         output_size=(640, 640),
-        hsv_prob=0.3
+        flip_prob=0.2,
+        affine_prob=0.2,
+        affine_degrees=0.0,
+        affine_scale=0.1,
+        affine_shear=10.0
 ):
     """
-    Creates a class-balanced, object-centric mosaic with optional copy-paste and HSV augmentation.
+    Creates a class-balanced, object-centric mosaic with geometric and copy-paste augmentations.
 
     Args:
-        images (List[np.ndarray]): List of all images in the dataset.
-        annotations (List[np.ndarray]): List of all annotation arrays for the dataset.
-        class_freqs (Dict[int, int]): Dictionary mapping class IDs to their frequencies.
-        extra_images (List[np.ndarray], optional): Images to use for copy-paste. Defaults to None.
-        extra_annotations (List[np.ndarray], optional): Annotations for the extra images. Defaults to None.
-        copy_paste_prob (float): Probability of applying copy-paste augmentation.
-        output_size (tuple): The final size of the mosaic image (width, height).
-        hsv_prob (float): Probability of applying HSV augmentation to each tile.
+        images (List[np.ndarray]): List of all images.
+        annotations (List[np.ndarray]): List of all annotation arrays.
+        class_freqs (Dict[int, int]): Dictionary of class frequencies.
+        extra_images (List[np.ndarray], optional): Images for copy-paste.
+        extra_annotations (List[np.ndarray], optional): Annotations for extra images.
+        copy_paste_prob (float): Probability of copy-paste augmentation.
+        output_size (tuple): Final size of the mosaic image.
+        flip_prob (float): Probability of horizontal flip.
+        affine_prob (float): Probability of affine transformations.
+        affine_degrees (float): Max rotation degrees for affine transform.
+        affine_scale (float): Max scale factor for affine transform.
+        affine_shear (float): Max shear degrees for affine transform.
+
     Returns:
-        Tuple[np.ndarray, np.ndarray]: The final mosaic image and its corresponding annotations.
+        Tuple[np.ndarray, np.ndarray]: The final mosaic image and its annotations.
     """
     # 1. Randomly choose the number of images for the mosaic
     n = random.choice([4, 6, 9])
@@ -105,8 +176,16 @@ def mosaic(
     for i in range(n):
         img, anns = selected_images[i], selected_annotations[i]
 
-        # Apply random HSV augmentation to the individual image
-        img = random_hsv(img.copy(), h_gain=0.01, s_gain=0.6, v_gain=0.4, prob=hsv_prob)
+        # --- APPLY NEW GEOMETRIC AUGMENTATIONS ---
+        img, anns = random_flip(img.copy(), anns.copy(), prob=flip_prob)
+        img, anns = random_affine(
+            img, anns,
+            degrees=affine_degrees,
+            scale=affine_scale,
+            shear=affine_shear,
+            prob=affine_prob
+        )
+        # --- END OF NEW AUGMENTATIONS ---
 
         img_h, img_w, _ = img.shape
 
@@ -156,7 +235,7 @@ def mosaic(
                     new_w / output_w, new_h / output_h
                 ])
 
-    # 5. Apply Copy-Paste Augmentation
+    # 5. Apply Copy-Paste Augmentation (Code remains the same)
     if extra_images and extra_annotations and random.random() < copy_paste_prob:
         # Select a random source image and annotation from the extra pool
         source_idx = random.randrange(len(extra_images))
@@ -194,6 +273,7 @@ def mosaic(
                     new_h = patch.shape[0] / output_h
 
                     final_annotations.append([class_id, new_cx, new_cy, new_w, new_h])
+
 
     return mosaic_img, np.array(final_annotations)
 
