@@ -11,7 +11,7 @@ def enhanced_mosaic(
     tile_sizes=(640,),
     crop_offset=0.2,
     copy_paste_prob=0.4,
-    gridmask_prob=0.3,
+    gridmask_prob=0.0,
     grid_ratio=0.7,
     jitter_params=None,
     max_retry=10,
@@ -19,14 +19,26 @@ def enhanced_mosaic(
 ):
     """
     Builds an object-centric, class-balanced mosaic with photometric jitter, GridMask, and Copy-Paste.
+    Now supports mosaics of 4, 6, or 9 images with true object-centric cropping.
     """
 
-    # Seed for reproducibility
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
 
-    # 1. Sample 4 images inversely by class frequency
+    # Choose mosaic type randomly
+    num_tiles = random.choice([4, 6, 9])
+    if num_tiles == 4:
+        grid_w, grid_h = 2, 2
+    elif num_tiles == 6:
+        if random.random() < 0.5:
+            grid_w, grid_h = 3, 2
+        else:
+            grid_w, grid_h = 2, 3
+    else:  # 9
+        grid_w, grid_h = 3, 3
+
+    # 1. Sample images inversely by class frequency
     weights = []
     for anns in annotations:
         if len(anns):
@@ -35,122 +47,84 @@ def enhanced_mosaic(
             w = 1.0
         weights.append(w)
     weights = np.array(weights) / sum(weights)
-    idxs = np.random.choice(len(images), size=4, replace=False, p=weights)
+    idxs = np.random.choice(len(images), size=num_tiles, replace=False, p=weights)
 
     # 2. Random tile size
     tile = random.choice(tile_sizes)
     w, h = tile, tile
 
-    # 3. Prepare resized & jittered quadrants
+    # 3. Prepare resized tiles
     quad_imgs = []
     quad_anns = []
-    for i, idx in enumerate(idxs):
+    for idx in idxs:
         img = cv2.resize(images[idx], (w, h))
         anns = annotations[idx]
-
-        count = len(anns)
-        if jitter_params is None:
-            mild = {'brightness': 0.2, 'noise_p': 0.3}
-            strong = {'brightness': 0.5, 'noise_p': 0.3}
-        else:
-            mild = jitter_params['mild']
-            strong = jitter_params['strong']
-
-        p = mild if count >= 3 else strong
-
-        # alpha = 1 + random.uniform(-p['brightness'], p['brightness'])
-        # beta = random.uniform(-p['brightness']*50, p['brightness']*50)
-        # img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
-        #
-        # if random.random() < p['noise_p']:
-        #     noise = np.random.randn(h, w, 3) * 25
-        #     img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
         quad_imgs.append(img)
         quad_anns.append(anns)
 
-    # 4. Create 2x2 mosaic canvas
-    canvas = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
-    offsets = [(0, 0), (w, 0), (0, h), (w, h)]
-    for img_q, (xo, yo) in zip(quad_imgs, offsets):
-        canvas[yo:yo+h, xo:xo+w] = img_q
+    # 4. Create mosaic canvas
+    canvas_w = w * grid_w
+    canvas_h = h * grid_h
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
-    # 5. Object-centric crop around center with jitter
-    for _ in range(max_retry):
-        dx = int(random.uniform(-crop_offset, crop_offset) * w)
-        dy = int(random.uniform(-crop_offset, crop_offset) * h)
-        cx = w + dx
-        cy = h + dy
-        x0 = max(0, min(cx - w // 2, 2 * w - w))
-        y0 = max(0, min(cy - h // 2, 2 * h - h))
+    offsets = []
+    i = 0
+    for gy in range(grid_h):
+        for gx in range(grid_w):
+            if i >= num_tiles:
+                break
+            xo, yo = gx * w, gy * h
+            canvas[yo:yo+h, xo:xo+w] = quad_imgs[i]
+            offsets.append((xo, yo))
+            i += 1
 
-        abs_boxes = []
-        abs_classes = []
-        for (anns, (xo, yo)) in zip(quad_anns, offsets):
-            for a in anns:
-                cls, x_c, y_c, bw, bh = a
-                ax = x_c * w + xo
-                ay = y_c * h + yo
-                abs_w = bw * w
-                abs_h = bh * h
-                abs_boxes.append((ax, ay, abs_w, abs_h))
-                abs_classes.append(int(cls))
+    # 5. Build absolute annotation list
+    abs_boxes = []
+    abs_classes = []
+    for (anns, (xo, yo)) in zip(quad_anns, offsets):
+        for a in anns:
+            cls, x_c, y_c, bw, bh = a
+            ax = x_c * w + xo
+            ay = y_c * h + yo
+            abs_w = bw * w
+            abs_h = bh * h
+            abs_boxes.append((ax, ay, abs_w, abs_h))
+            abs_classes.append(int(cls))
 
-        keep = []
-        for (ax, ay, aw, ah), cls in zip(abs_boxes, abs_classes):
-            if (x0 < ax < x0 + w) and (y0 < ay < y0 + h):
-                keep.append((cls, ax, ay, aw, ah))
-        if keep:
-            break
+    # If no objects, fallback to center crop
+    if not abs_boxes:
+        crop_center_x = canvas_w // 2
+        crop_center_y = canvas_h // 2
+    else:
+        # Pick a random object's center
+        ax, ay, _, _ = random.choice(abs_boxes)
+        # Apply jitter
+        crop_center_x = ax + random.uniform(-crop_offset, crop_offset) * w
+        crop_center_y = ay + random.uniform(-crop_offset, crop_offset) * h
+
+    # Clamp crop center so it fits inside canvas
+    x0 = int(max(0, min(crop_center_x - w // 2, canvas_w - w)))
+    y0 = int(max(0, min(crop_center_y - h // 2, canvas_h - h)))
+
+    # 6. Keep only annotations inside crop
+    keep = []
+    for (ax, ay, aw, ah), cls in zip(abs_boxes, abs_classes):
+        if (x0 < ax < x0 + w) and (y0 < ay < y0 + h):
+            keep.append((cls, ax, ay, aw, ah))
 
     cropped = canvas[y0:y0+h, x0:x0+w]
 
-    # 6. Update annotations to new crop frame
+    # 7. Convert kept annotations to relative coords
     new_anns = []
     for (cls, ax, ay, aw, ah) in keep:
         x_center = (ax - x0) / w
         y_center = (ay - y0) / h
         bw = aw / w
         bh = ah / h
-
         if 0 < x_center < 1 and 0 < y_center < 1:
             new_anns.append([cls, x_center, y_center, bw, bh])
 
-    # 7. GridMask
-    if random.random() < gridmask_prob and len(new_anns) > 0:
-        mask = np.ones((h, w), dtype=np.uint8)
-        d = int(w * grid_ratio)
-        top = random.randint(0, d)
-        left = random.randint(0, d)
-        for y in range(-d, h, d * 2):
-            for x in range(-d, w, d * 2):
-                y1 = y + top
-                x1 = x + left
-                mask[max(0, y1):min(h, y1 + d), max(0, x1):min(w, x1 + d)] = 0
-        cropped = cv2.bitwise_and(cropped, cropped, mask=mask)
-
-        # Remove annotations fully in black area
-        visible_anns = []
-        for ann in new_anns:
-            cls, x_c, y_c, bw, bh = ann
-            cx = int(x_c * w)
-            cy = int(y_c * h)
-            box_w = int(bw * w / 2)
-            box_h = int(bh * h / 2)
-            x0_box = max(0, cx - box_w)
-            y0_box = max(0, cy - box_h)
-            x1_box = min(w, cx + box_w)
-            y1_box = min(h, cy + box_h)
-
-            patch_mask = mask[y0_box:y1_box, x0_box:x1_box]
-            visible_ratio = np.mean(patch_mask)  # 1 = fully visible, 0 = fully masked
-
-            if visible_ratio > 0.3:  # keep box if 30%+ visible
-                visible_anns.append(ann)
-
-        new_anns = visible_anns
-
-    # 8. Copy-Paste small objects
+    # 8. Copy-Paste augmentation
     if (
         extra_images and extra_annotations
         and random.random() < copy_paste_prob
@@ -159,7 +133,6 @@ def enhanced_mosaic(
         ei = random.randrange(len(extra_images))
         src = extra_images[ei]
         eanns = extra_annotations[ei]
-
         if len(eanns):
             a = random.choice(eanns)
             cls, x_c, y_c, bw, bh = a
@@ -168,17 +141,11 @@ def enhanced_mosaic(
             y0o = int((y_c - bh / 2) * ih)
             w_obj = int(bw * iw)
             h_obj = int(bh * ih)
-
-            # check bounds
-            if x0o < 0 or y0o < 0 or x0o + w_obj > iw or y0o + h_obj > ih:
-                pass  # skip invalid patch
-            elif w_obj > 0 and h_obj > 0:
+            if x0o >= 0 and y0o >= 0 and x0o + w_obj <= iw and y0o + h_obj <= ih and w_obj > 0 and h_obj > 0:
                 patch = src[y0o:y0o+h_obj, x0o:x0o+w_obj]
-
                 if patch.shape[0] <= h and patch.shape[1] <= w:
                     px = random.randint(0, w - patch.shape[1])
                     py = random.randint(0, h - patch.shape[0])
-
                     cropped[py:py+patch.shape[0], px:px+patch.shape[1]] = patch
                     new_anns.append([
                         int(cls),
