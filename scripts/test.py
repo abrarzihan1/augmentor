@@ -55,8 +55,8 @@ def draw_image(image, bboxes, class_names=None, color=(0, 255, 0), thickness=2):
     return img_out
 
 # Define paths for input images and annotations
-image_dir = '../datasets/tomato/train/images/'
-annotation_dir = '../datasets/tomato/train/labels/'
+image_dir = '../datasets/WeedCrop1/train/images/'
+annotation_dir = '../datasets/WeedCrop1/train/labels/'
 
 # Create a list of all JPEG files in the image directory
 image_files = [f for f in os.listdir(image_dir) if f.endswith('.jpg')]
@@ -101,7 +101,7 @@ for seed in seeds:
             # If the augmentation function is deterministic, you might need to introduce
             # randomness here if you want varied augmentations for the same input image.
 
-            aug_img, aug_labels = augment.rotation(image, annotation)  # Your augmentation function
+            aug_img, aug_labels = augment.brightness_contrast(image, annotation)  # Your augmentation function
             aug_img = draw_image(aug_img, aug_labels)
 
             # Split the base name and extension
@@ -115,6 +115,6 @@ for seed in seeds:
             cv2.imwrite(os.path.join(output_img_dir, output_image_filename), aug_img)
             utils.save_yolo_annotation(os.path.join(output_annotation_dir, output_annotation_filename), aug_labels)
 
-    # Copy original files to the augmentation directories after processing
-    utils.copy_folder_contents(image_dir, output_img_dir)
-    utils.copy_folder_contents(annotation_dir, output_annotation_dir)
+    # # Copy original files to the augmentation directories after processing
+    # utils.copy_folder_contents(image_dir, output_img_dir)
+    # utils.copy_folder_contents(annotation_dir, output_annotation_dir)
